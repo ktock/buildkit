@@ -43,7 +43,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -54,6 +53,7 @@ import (
 	"unsafe"
 
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/stargz-snapshotter/cache"
 	snbase "github.com/containerd/stargz-snapshotter/snapshot"
 	"github.com/containerd/stargz-snapshotter/stargz/config"
@@ -64,7 +64,6 @@ import (
 	"github.com/containerd/stargz-snapshotter/task"
 	"github.com/golang/groupcache/lru"
 	"github.com/google/crfs/stargz"
-	"github.com/google/go-containerregistry/pkg/authn"
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	digest "github.com/opencontainers/go-digest"
@@ -108,12 +107,12 @@ const (
 type Option func(*options)
 
 type options struct {
-	keychain []authn.Keychain
+	hosts remote.RegistryHosts
 }
 
-func WithKeychain(keychain []authn.Keychain) Option {
+func WithRegistryHosts(hosts remote.RegistryHosts) Option {
 	return func(opts *options) {
-		opts.keychain = keychain
+		opts.hosts = hosts
 	}
 }
 
@@ -154,9 +153,6 @@ func NewFilesystem(root string, cfg config.Config, opts ...Option) (_ snbase.Fil
 			return nil, errors.Wrap(err, "failed to prepare filesystem cache")
 		}
 	}
-	keychain := authn.NewMultiKeychain(append(
-		[]authn.Keychain{authn.DefaultKeychain},
-		fsOpts.keychain...)...)
 	resolveResultEntry := cfg.ResolveResultEntry
 	if resolveResultEntry == 0 {
 		resolveResultEntry = defaultResolveResultEntry
@@ -165,30 +161,37 @@ func NewFilesystem(root string, cfg config.Config, opts ...Option) (_ snbase.Fil
 	if prefetchTimeout == 0 {
 		prefetchTimeout = defaultPrefetchTimeoutSec * time.Second
 	}
+	hosts := fsOpts.hosts
+	if hosts == nil {
+		registries := docker.ConfigureDefaultRegistries(
+			docker.WithPlainHTTP(docker.MatchLocalhost))
+		hosts = func(host string, _ map[string]string) ([]docker.RegistryHost, error) {
+			return registries(host)
+		}
+	}
 	return &filesystem{
-		resolver:              remote.NewResolver(keychain, cfg.ResolverConfig),
-		blobConfig:            cfg.BlobConfig,
-		httpCache:             httpCache,
+		resolver:              remote.NewResolver(hosts, httpCache, cfg.BlobConfig),
 		fsCache:               fsCache,
 		prefetchSize:          cfg.PrefetchSize,
 		prefetchTimeout:       prefetchTimeout,
 		noprefetch:            cfg.NoPrefetch,
+		noBackgroundFetch:     cfg.NoBackgroundFetch,
 		debug:                 cfg.Debug,
 		layer:                 make(map[string]*layer),
 		resolveResult:         lru.New(resolveResultEntry),
 		backgroundTaskManager: task.NewBackgroundTaskManager(2, 5*time.Second),
 		allowNoVerification:   cfg.AllowNoVerification,
+		disableVerification:   cfg.DisableVerification,
 	}, nil
 }
 
 type filesystem struct {
 	resolver              *remote.Resolver
-	blobConfig            config.BlobConfig
-	httpCache             cache.BlobCache
 	fsCache               cache.BlobCache
 	prefetchSize          int64
 	prefetchTimeout       time.Duration
 	noprefetch            bool
+	noBackgroundFetch     bool
 	debug                 bool
 	layer                 map[string]*layer
 	layerMu               sync.Mutex
@@ -196,6 +199,7 @@ type filesystem struct {
 	resolveResultMu       sync.Mutex
 	backgroundTaskManager *task.BackgroundTaskManager
 	allowNoVerification   bool
+	disableVerification   bool
 }
 
 func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[string]string) error {
@@ -229,10 +233,13 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 				rr = c.(*resolveResult) // resolving in progress
 			} else if _, err := c.(*resolveResult).get(); err == nil {
 				rr = c.(*resolveResult) // hit successfully resolved cache
+			} else {
+				rr = c.(*resolveResult).retry()
+				fs.resolveResult.Add(key, rr)
 			}
 		}
 		if rr == nil { // missed cache
-			rr = fs.resolve(ctx, ref, dgst)
+			rr = fs.resolve(ctx, ref, dgst, labels)
 			fs.resolveResult.Add(key, rr)
 		}
 		if dgst == ldgst {
@@ -252,12 +259,17 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 		log.G(ctx).WithError(err).Debug("failed to resolve layer")
 		return errors.Wrapf(err, "failed to resolve layer(%q,%q)", ref, ldgst)
 	}
-	if err := fs.check(ctx, l); err != nil { // check the connectivity
+	if err := fs.check(ctx, l, labels); err != nil { // check the connectivity
 		return err
 	}
 
-	// Verify this layer using the TOC JSON digest passed through label.
-	if tocDigest, ok := labels[verify.TOCJSONDigestAnnotation]; ok {
+	// Verify layer's content
+	if fs.disableVerification {
+		// Skip if verification is disabled completely
+		l.skipVerify()
+		log.G(ctx).Debugf("Verification forcefully skipped")
+	} else if tocDigest, ok := labels[verify.TOCJSONDigestAnnotation]; ok {
+		// Verify this layer using the TOC JSON digest passed through label.
 		dgst, err := digest.Parse(tocDigest)
 		if err != nil {
 			log.G(ctx).WithError(err).Debugf("failed to parse passed TOC digest %q", dgst)
@@ -289,28 +301,15 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 	fs.layer[mountpoint] = l
 	fs.layerMu.Unlock()
 
-	// RoundTripper only used for pre-/background-fetch.
-	// We use a separated transport because we don't want these fetching
-	// functionalities to disturb other HTTP-related operations
-	fetchTr := lazyTransport(func() (http.RoundTripper, error) {
-		return l.blob.Authn(http.DefaultTransport.(*http.Transport).Clone())
-	})
-
 	// Prefetch this layer. We prefetch several layers in parallel. The first
-	// Check() for this layer waits for the prefetch completion. We recreate
-	// RoundTripper to avoid disturbing other NW-related operations.
+	// Check() for this layer waits for the prefetch completion.
 	if !fs.noprefetch {
 		l.doPrefetch()
 		go func() {
 			defer l.donePrefetch()
 			fs.backgroundTaskManager.DoPrioritizedTask()
 			defer fs.backgroundTaskManager.DonePrioritizedTask()
-			tr, err := fetchTr()
-			if err != nil {
-				log.G(ctx).WithError(err).Debug("failed to prepare transport for prefetch")
-				return
-			}
-			if err := l.prefetch(prefetchSize, remote.WithRoundTripper(tr)); err != nil {
+			if err := l.prefetch(prefetchSize); err != nil {
 				log.G(ctx).WithError(err).Debug("failed to prefetched layer")
 				return
 			}
@@ -321,36 +320,30 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 	// Fetch whole layer aggressively in background. We use background
 	// reader for this so prioritized tasks(Mount, Check, etc...) can
 	// interrupt the reading. This can avoid disturbing prioritized tasks
-	// about NW traffic. We read layer with a buffer to reduce num of
-	// requests to the registry.
-	go func() {
-		br := io.NewSectionReader(readerAtFunc(func(p []byte, offset int64) (retN int, retErr error) {
-			fs.backgroundTaskManager.InvokeBackgroundTask(func(ctx context.Context) {
-				tr, err := fetchTr()
-				if err != nil {
-					log.G(ctx).WithError(err).Debug("failed to prepare transport for background fetch")
-					retN, retErr = 0, err
-					return
-				}
-				retN, retErr = l.blob.ReadAt(
-					p,
-					offset,
-					remote.WithContext(ctx),              // Make cancellable
-					remote.WithRoundTripper(tr),          // Use dedicated Transport
-					remote.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
-				)
-			}, 120*time.Second)
-			return
-		}), 0, l.blob.Size())
-		if err := layerReader.Cache(
-			reader.WithReader(br),                // Read contents in background
-			reader.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
-		); err != nil {
-			log.G(ctx).WithError(err).Debug("failed to fetch whole layer")
-			return
-		}
-		log.G(ctx).Debug("completed to fetch all layer data in background")
-	}()
+	// about NW traffic.
+	if !fs.noBackgroundFetch {
+		go func() {
+			br := io.NewSectionReader(readerAtFunc(func(p []byte, offset int64) (retN int, retErr error) {
+				fs.backgroundTaskManager.InvokeBackgroundTask(func(ctx context.Context) {
+					retN, retErr = l.blob.ReadAt(
+						p,
+						offset,
+						remote.WithContext(ctx),              // Make cancellable
+						remote.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
+					)
+				}, 120*time.Second)
+				return
+			}), 0, l.blob.Size())
+			if err := layerReader.Cache(
+				reader.WithReader(br),                // Read contents in background
+				reader.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
+			); err != nil {
+				log.G(ctx).WithError(err).Debug("failed to fetch whole layer")
+				return
+			}
+			log.G(ctx).Debug("completed to fetch all layer data in background")
+		}()
+	}
 
 	// Mounting stargz
 	// TODO: bind mount the state directory as a read-only fs on snapshotter's side
@@ -381,16 +374,30 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 	return server.WaitMount()
 }
 
-func (fs *filesystem) resolve(ctx context.Context, ref, digest string) *resolveResult {
+func (fs *filesystem) resolve(ctx context.Context, ref, digest string, labels map[string]string) *resolveResult {
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("ref", ref).WithField("digest", digest))
+	var (
+		resolvedBlob   remote.Blob
+		resolvedBlobMu sync.Mutex
+	)
 	return newResolveResult(func() (*layer, error) {
 		log.G(ctx).Debugf("resolving")
-		defer log.G(ctx).Debugf("resolved")
 
 		// Resolve the reference and digest
-		blob, err := fs.resolver.Resolve(ref, digest, fs.httpCache, fs.blobConfig)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to resolve the reference")
+		// If the previous result is cached and can be used, use it.
+		resolvedBlobMu.Lock()
+		blob := resolvedBlob
+		resolvedBlobMu.Unlock()
+		if blob == nil || blob.Check() != nil {
+			var err error
+			blob, err = fs.resolver.Resolve(ref, digest, labels)
+			if err != nil {
+				log.G(ctx).WithError(err).Debugf("failed to resolve ref")
+				return nil, errors.Wrap(err, "failed to resolve the reference")
+			}
+			resolvedBlobMu.Lock()
+			resolvedBlob = blob
+			resolvedBlobMu.Unlock()
 		}
 
 		// Get a reader for stargz archive.
@@ -404,14 +411,16 @@ func (fs *filesystem) resolve(ctx context.Context, ref, digest string) *resolveR
 		}), 0, blob.Size())
 		vr, root, err := reader.NewReader(sr, fs.fsCache)
 		if err != nil {
+			log.G(ctx).WithError(err).Debugf("failed to resolve: layer cannot be read")
 			return nil, errors.Wrap(err, "failed to read layer")
 		}
 
+		log.G(ctx).Debugf("resolved")
 		return newLayer(blob, vr, root, fs.prefetchTimeout), nil
 	})
 }
 
-func (fs *filesystem) Check(ctx context.Context, mountpoint string) error {
+func (fs *filesystem) Check(ctx context.Context, mountpoint string, labels map[string]string) error {
 	// This is a prioritized task and all background tasks will be stopped
 	// execution so this can avoid being disturbed for NW traffic by background
 	// tasks.
@@ -429,7 +438,7 @@ func (fs *filesystem) Check(ctx context.Context, mountpoint string) error {
 	}
 
 	// Check the blob connectivity and refresh the connection if possible
-	if err := fs.check(ctx, l); err != nil {
+	if err := fs.check(ctx, l, labels); err != nil {
 		log.G(ctx).WithError(err).Warn("check failed")
 		return err
 	}
@@ -442,12 +451,13 @@ func (fs *filesystem) Check(ctx context.Context, mountpoint string) error {
 	return nil
 }
 
-func (fs *filesystem) check(ctx context.Context, l *layer) error {
+func (fs *filesystem) check(ctx context.Context, l *layer, labels map[string]string) error {
 	if err := l.blob.Check(); err != nil {
 		// Check failed. Try to refresh the connection
+		retrynum := 1
 		log.G(ctx).WithError(err).Warn("failed to connect to blob; refreshing...")
-		for retry := 0; retry < 3; retry++ {
-			if iErr := fs.resolver.Refresh(l.blob); iErr != nil {
+		for retry := 0; retry < retrynum; retry++ {
+			if iErr := l.blob.Refresh(labels); iErr != nil {
 				log.G(ctx).WithError(iErr).Warnf("failed to refresh connection(%d)",
 					retry)
 				err = errors.Wrapf(err, "error(%d): %v", retry, iErr)
@@ -517,35 +527,16 @@ func (fs *filesystem) parseLabels(labels map[string]string) (rRef, rDigest strin
 	return
 }
 
-func lazyTransport(trFunc func() (http.RoundTripper, error)) func() (http.RoundTripper, error) {
-	var (
-		tr   http.RoundTripper
-		trMu sync.Mutex
-	)
-	return func() (http.RoundTripper, error) {
-		trMu.Lock()
-		defer trMu.Unlock()
-		if tr != nil {
-			return tr, nil
-		}
-		gotTr, err := trFunc()
-		if err != nil {
-			return nil, err
-		}
-		tr = gotTr
-		return tr, nil
-	}
-}
-
-func newResolveResult(init func() (*layer, error)) *resolveResult {
+func newResolveResult(resolveFunc func() (*layer, error)) *resolveResult {
 	rr := &resolveResult{
-		progress: newWaiter(),
+		resolveFunc: resolveFunc,
+		progress:    newWaiter(),
 	}
 	rr.progress.start()
 
 	go func() {
 		rr.resultMu.Lock()
-		rr.layer, rr.err = init()
+		rr.layer, rr.err = resolveFunc()
 		rr.resultMu.Unlock()
 		rr.progress.done()
 	}()
@@ -554,10 +545,11 @@ func newResolveResult(init func() (*layer, error)) *resolveResult {
 }
 
 type resolveResult struct {
-	layer    *layer
-	err      error
-	resultMu sync.Mutex
-	progress *waiter
+	resolveFunc func() (*layer, error)
+	layer       *layer
+	err         error
+	resultMu    sync.Mutex
+	progress    *waiter
 }
 
 func (rr *resolveResult) waitAndGet(timeout time.Duration) (*layer, error) {
@@ -578,6 +570,10 @@ func (rr *resolveResult) get() (*layer, error) {
 
 func (rr *resolveResult) isInProgress() bool {
 	return rr.progress.isInProgress()
+}
+
+func (rr *resolveResult) retry() *resolveResult {
+	return newResolveResult(rr.resolveFunc)
 }
 
 func newLayer(blob remote.Blob, vr reader.VerifiableReader, root *stargz.TOCEntry, prefetchTimeout time.Duration) *layer {

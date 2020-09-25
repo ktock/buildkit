@@ -146,11 +146,23 @@ func (cr *cacheRecord) isLazy(ctx context.Context) (bool, error) {
 	if !getBlobOnly(cr.md) {
 		return false, nil
 	}
+
+	// If the content hasn't been downloaded, this layer is lazy.
 	_, err := cr.cm.ContentStore.Info(ctx, digest.Digest(getBlob(cr.md)))
 	if errors.Is(err, errdefs.ErrNotFound) {
 		return true, nil
+	} else if err != nil {
+		return false, err
 	}
-	return false, err
+
+	// If the snapshot is a remote snapshot, this layer is lazy.
+	if info, err := cr.cm.Snapshotter.Stat(ctx, getSnapshotID(cr.md)); err == nil {
+		if _, ok := info.Labels["containerd.io/snapshot/remote"]; ok {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 func (cr *cacheRecord) IdentityMapping() *idtools.IdentityMapping {
@@ -400,9 +412,17 @@ func (sr *immutableRef) Extract(ctx context.Context) (rerr error) {
 
 func (sr *immutableRef) prepareRemoteSnapshots(ctx context.Context, dhs DescHandlers) (bool, error) {
 	ok, err := sr.sizeG.Do(ctx, sr.ID()+"-prepare-remote-snapshot", func(ctx context.Context) (_ interface{}, rerr error) {
-		snapshotID := getSnapshotID(sr.md)
-		if _, err := sr.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
-			return true, nil
+		var (
+			snapshotID = getSnapshotID(sr.md)
+			update     bool
+		)
+		if info, err := sr.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
+			if _, ok := info.Labels["containerd.io/snapshot/remote"]; !ok {
+				// This is a non-remote snapshot
+				return true, nil
+			}
+			// This is a remote snapshot. Refresh labels with latest ones.
+			update = true
 		}
 		desc, err := sr.ociDesc()
 		if err != nil {
@@ -427,14 +447,29 @@ func (sr *immutableRef) prepareRemoteSnapshots(ctx context.Context, dhs DescHand
 			labels = make(map[string]string)
 		}
 		labels["containerd.io/snapshot.ref"] = snapshotID
-		opt := snapshots.WithLabels(labels)
 
-		// Try to preapre the remote snapshot
-		key := fmt.Sprintf("tmp-%s %s", identity.NewID(), sr.Info().ChainID)
-		if err = sr.cm.Snapshotter.Prepare(ctx, key, parentID, opt); err != nil {
-			if errdefs.IsAlreadyExists(err) {
-				// Check if the targeting snapshot ID has been prepared as a remote
-				// snapshot in the snapshotter.
+		if update {
+			// Update the snapshot's labels information to the latest ones. This allows
+			// the snapshotter to refresh the registry configuration (e.g. for updating
+			// creds) using these new labels.
+			var fieldpaths []string
+			for k := range labels {
+				fieldpaths = append(fieldpaths, "labels."+k)
+			}
+			if _, err := sr.cm.Snapshotter.Update(ctx, snapshots.Info{
+				Name:   snapshotID,
+				Labels: labels,
+			}, fieldpaths...); err == nil {
+				return true, nil
+			}
+		} else {
+			// Try to preapre the remote snapshot
+			opt := snapshots.WithLabels(labels)
+			key := fmt.Sprintf("tmp-%s %s", identity.NewID(), sr.Info().ChainID)
+			err := sr.cm.Snapshotter.Prepare(ctx, key, parentID, opt)
+			if err != nil && errdefs.IsAlreadyExists(err) {
+				// Check if the targeting snapshot ID has been prepared as a
+				// remote snapshot in the snapshotter.
 				if _, err := sr.cm.Snapshotter.Stat(ctx, snapshotID); err == nil {
 					// We can use this remote snapshot without unlazying.
 					// Try the next layer as well.

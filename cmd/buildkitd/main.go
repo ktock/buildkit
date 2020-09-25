@@ -67,7 +67,8 @@ func init() {
 }
 
 type workerInitializerOpt struct {
-	config *config.Config
+	config         *config.Config
+	sessionManager *session.Manager
 }
 
 type workerInitializer struct {
@@ -587,7 +588,8 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		return nil, err
 	}
 	wc, err := newWorkerController(c, workerInitializerOpt{
-		config: cfg,
+		config:         cfg,
+		sessionManager: sessionManager,
 	})
 	if err != nil {
 		return nil, err

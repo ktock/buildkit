@@ -232,6 +232,25 @@ func (p *puller) CacheKey(ctx context.Context, g session.Group, index int) (cach
 				}
 				labels[layersKey] = strings.TrimSuffix(layers, ",")
 
+				var (
+					sidKey = "containerd.io/snapshot/buildkit/session"
+					ids    string
+					i      int
+				)
+				for _, id := range session.AllSessionIDs(g) {
+					is := fmt.Sprintf("%s,", id)
+					// This avoids the label hits the size limitation.
+					if err := ctdlabels.Validate(sidKey, ids+is); err != nil {
+						labels[fmt.Sprintf("%s.%d", sidKey, i)] = strings.TrimSuffix(ids, ",")
+						ids = is
+						i++
+						continue
+					}
+					ids += is
+				}
+				labels[fmt.Sprintf("%s.%d", sidKey, i)] = strings.TrimSuffix(ids, ",")
+				labels[fmt.Sprintf("%s.keys", sidKey)] = fmt.Sprintf("%d", i+1)
+
 				p.descHandlers[desc.Digest] = &cache.DescHandler{
 					Provider:       p.manifest.Remote.Provider,
 					Progress:       progressController,

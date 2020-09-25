@@ -3,16 +3,20 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	fuseoverlayfs "github.com/AkihiroSuda/containerd-fuse-overlayfs"
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/pkg/dialer"
+	"github.com/containerd/containerd/remotes/docker"
 	ctdsnapshot "github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
 	"github.com/containerd/containerd/snapshots/overlay"
@@ -20,10 +24,13 @@ import (
 	"github.com/containerd/containerd/sys"
 	remotesn "github.com/containerd/stargz-snapshotter/snapshot"
 	"github.com/containerd/stargz-snapshotter/stargz"
+	"github.com/containerd/stargz-snapshotter/stargz/remote"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/executor/oci"
+	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/network/cniprovider"
 	"github.com/moby/buildkit/util/network/netproviders"
+	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/runc"
@@ -230,7 +237,8 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		return nil, err
 	}
 
-	snFactory, err := snapshotterFactory(common.config.Root, cfg)
+	hosts := resolverFunc(common.config)
+	snFactory, err := snapshotterFactory(common.config.Root, cfg, common.sessionManager, hosts)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +275,7 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		return nil, err
 	}
 	opt.GCPolicy = getGCPolicy(cfg.GCConfig, common.config.Root)
-	opt.RegistryHosts = resolverFunc(common.config)
+	opt.RegistryHosts = hosts
 
 	if platformsStr := cfg.Platforms; len(platformsStr) != 0 {
 		platforms, err := parsePlatforms(platformsStr)
@@ -283,7 +291,7 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 	return []worker.Worker{w}, nil
 }
 
-func snapshotterFactory(commonRoot string, cfg config.OCIConfig) (runc.SnapshotterFactory, error) {
+func snapshotterFactory(commonRoot string, cfg config.OCIConfig, sm *session.Manager, hosts docker.RegistryHosts) (runc.SnapshotterFactory, error) {
 	var (
 		name    = cfg.Snapshotter
 		address = cfg.ProxySnapshotterPath
@@ -350,11 +358,19 @@ func snapshotterFactory(commonRoot string, cfg config.OCIConfig) (runc.Snapshott
 	case "stargz":
 		snFactory.New = func(root string) (ctdsnapshot.Snapshotter, error) {
 			fs, err := stargz.NewFilesystem(filepath.Join(root, "stargz"),
-				cfg.StargzSnapshotterConfig)
+				cfg.StargzSnapshotterConfig,
+
+				// Use RegistryHosts based on the buildkit's registry config and session
+				stargz.WithRegistryHosts(hostsWithSession(
+					docker.Registries(hosts, docker.ConfigureDefaultRegistries(
+						docker.WithPlainHTTP(docker.MatchLocalhost))),
+					sm)),
+			)
 			if err != nil {
 				return nil, err
 			}
-			return remotesn.NewSnapshotter(filepath.Join(root, "snapshotter"),
+			return remotesn.NewSnapshotter(context.Background(),
+				filepath.Join(root, "snapshotter"),
 				fs, remotesn.AsynchronousRemove)
 		}
 	default:
@@ -371,4 +387,45 @@ func validOCIBinary() bool {
 		return false
 	}
 	return true
+}
+
+// hostsWithSession returns a callback as registry configuration similer to containerd's
+// `docker.RegistryHosts`. This callback is called everytime the snapshotter resolves an
+// image reference of a snapshot. In addition to the `host`, This callback also takes`labels`
+// which is set on the snapshot. These labels contain the reference of the snapshot and session
+// IDs to be used, etc.
+func hostsWithSession(hosts docker.RegistryHosts, sm *session.Manager) remote.RegistryHosts {
+	return func(host string, labels map[string]string) ([]docker.RegistryHost, error) {
+
+		// Get the reference of the image that contain this layer.
+		ref, ok := labels["containerd.io/snapshot/remote/stargz.reference"]
+		if !ok {
+			return nil, errors.Errorf("reference must be passed")
+		}
+
+		// Get session IDs that can be used for resolving this layer.
+		var (
+			sKey = "containerd.io/snapshot/buildkit/session"
+			sids []string
+		)
+		nsStr, ok := labels[sKey+".keys"]
+		if !ok {
+			return nil, errors.Errorf("number of session keys must be passed")
+		}
+		ns, err := strconv.ParseInt(nsStr, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "number of session keys is invalid: %q", nsStr)
+		}
+		for i := 0; i < int(ns); i++ {
+			id, ok := labels[fmt.Sprintf("%s.%d", sKey, i)]
+			if !ok {
+				break
+			}
+			sids = append(sids, strings.Split(id, ",")...)
+		}
+
+		// Get the registry configuration
+		return resolver.DefaultPool.GetResolver(
+			hosts, ref, "pull", sm, session.NewGroup(sids...)).HostsFunc(host)
+	}
 }

@@ -29,31 +29,16 @@ type Config struct {
 	PrefetchSize        int64  `toml:"prefetch_size"`
 	PrefetchTimeoutSec  int64  `toml:"prefetch_timeout_sec"`
 	NoPrefetch          bool   `toml:"noprefetch"`
+	NoBackgroundFetch   bool   `toml:"no_background_fetch"`
 	Debug               bool   `toml:"debug"`
 	AllowNoVerification bool   `toml:"allow_no_verification"`
-
-	// ResolverConfig is config for resolving registries.
-	ResolverConfig `toml:"resolver"`
+	DisableVerification bool   `toml:"disable_verification"`
 
 	// BlobConfig is config for layer blob management.
 	BlobConfig `toml:"blob"`
 
 	// DirectoryCacheConfig is config for directory-based cache.
 	DirectoryCacheConfig `toml:"directory_cache"`
-}
-
-type ResolverConfig struct {
-	Host                map[string]HostConfig `toml:"host"`
-	ConnectionPoolEntry int                   `toml:"connection_pool_entry"`
-}
-
-type HostConfig struct {
-	Mirrors []MirrorConfig `toml:"mirrors"`
-}
-
-type MirrorConfig struct {
-	Host     string `toml:"host"`
-	Insecure bool   `toml:"insecure"`
 }
 
 type BlobConfig struct {
