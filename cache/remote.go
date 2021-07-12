@@ -66,7 +66,8 @@ func (sr *immutableRef) GetRemote(ctx context.Context, createIfNeeded bool, comp
 		// update distribution source annotation for lazy-refs (non-lazy refs
 		// will already have their dsl stored in the content store, which is
 		// used by the push handlers)
-		if isLazy, err := ref.isLazy(ctx); err != nil {
+		isLazy, err := ref.isLazy(ctx)
+		if err != nil {
 			return nil, err
 		} else if isLazy {
 			imageRefs := getImageRefs(ref.md)
@@ -102,30 +103,38 @@ func (sr *immutableRef) GetRemote(ctx context.Context, createIfNeeded bool, comp
 					existingRepos = append(existingRepos, repo)
 				}
 				desc.Annotations[dslKey] = strings.Join(existingRepos, ",")
+				if dh, ok := sr.descHandlers[desc.Digest]; ok {
+					desc.Annotations = mergeEStargzAnnotations(dh.SnapshotLabels, desc.Annotations)
+				}
 			}
+		}
+
+		if !isLazy && compressionType == compression.EStargz {
+			a, err := loadEStargzAnnotations(ctx, sr.cm.ContentStore, desc.Digest)
+			if err != nil {
+				return nil, err
+			}
+			desc.Annotations = mergeEStargzAnnotations(a, desc.Annotations)
 		}
 
 		if forceCompression {
 			// ensure the compression type.
 			// compressed blob must be created and stored in the content store.
-			_, convertMediaTypeFunc, err := getConverters(desc, compressionType)
+			_, convertDescFunc, err := getConverters(desc, compressionType)
 			if err != nil {
 				return nil, err
 			}
-			if convertMediaTypeFunc != nil {
+			if convertDescFunc != nil {
 				// needs conversion
 				info, err := ref.getCompressionBlob(ctx, compressionType)
 				if err != nil {
 					return nil, err
 				}
-				newDesc := desc
-				newDesc.MediaType = convertMediaTypeFunc(newDesc.MediaType)
-				newDesc.Digest = info.Digest
-				newDesc.Size = info.Size
+				newDesc := convertDescFunc(desc, info)
 				if desc.Digest != newDesc.Digest {
 					mproviderBase.Add(newDesc.Digest, ref.cm.ContentStore)
 				}
-				desc = newDesc
+				desc = *newDesc
 			}
 		}
 
@@ -210,6 +219,11 @@ func (p lazyRefProvider) Unlazy(ctx context.Context) error {
 			Manager:  p.ref.cm.ContentStore,
 		}, p.desc, p.dh.Ref, logs.LoggerFromContext(ctx))
 		if err != nil {
+			return nil, err
+		}
+
+		// Save estargz-related annotations if contained
+		if err := saveEStargzAnnotations(ctx, p.ref.cm.ContentStore, p.desc.Digest, p.dh.SnapshotLabels); err != nil {
 			return nil, err
 		}
 

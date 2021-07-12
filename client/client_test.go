@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -2396,35 +2395,45 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 
 	// Prepare stargz image
 	orgImage := "docker.io/library/alpine:latest"
-	sgzImage := registry + "/stargz/alpine:latest"
-	ctrRemoteCommonArg := []string{"--namespace", "buildkit", "--address", cdAddress}
-	err = exec.Command("ctr-remote", append(ctrRemoteCommonArg, "i", "pull", orgImage)...).Run()
+	sgzImage := registry + "/stargz/alpine:" + identity.NewID()
+	def, err := llb.Image(orgImage).Marshal(sb.Context())
 	require.NoError(t, err)
-	err = exec.Command("ctr-remote", append(ctrRemoteCommonArg, "i", "optimize", "--oci", "--period=1", orgImage, sgzImage)...).Run()
-	require.NoError(t, err)
-	err = exec.Command("ctr-remote", append(ctrRemoteCommonArg, "i", "push", "--plain-http", sgzImage)...).Run()
-	require.NoError(t, err)
-
-	// clear all local state out
-	err = imageService.Delete(ctx, orgImage, images.SynchronousDelete())
-	require.NoError(t, err)
-	err = imageService.Delete(ctx, sgzImage, images.SynchronousDelete())
-	require.NoError(t, err)
-	checkAllReleasable(t, c, sb, true)
-
-	// stargz layers should be lazy even for executing something on them
-	def, err := llb.Image(sgzImage).
-		Run(llb.Args([]string{"/bin/touch", "/foo"})).
-		Marshal(sb.Context())
-	require.NoError(t, err)
-	target := registry + "/buildkit/testlazyimage:latest"
 	_, err = c.Solve(sb.Context(), def, SolveOpt{
 		Exports: []ExportEntry{
 			{
 				Type: ExporterImage,
 				Attrs: map[string]string{
-					"name": target,
-					"push": "true",
+					"name":              sgzImage,
+					"push":              "true",
+					"compression":       "estargz",
+					"oci-mediatypes":    "true",
+					"force-compression": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	// clear all local state out
+	err = imageService.Delete(ctx, sgzImage, images.SynchronousDelete())
+	require.NoError(t, err)
+	checkAllReleasable(t, c, sb, true)
+
+	// stargz layers should be lazy even for executing something on them
+	def, err = llb.Image(sgzImage).
+		Run(llb.Args([]string{"/bin/touch", "/foo"})).
+		Marshal(sb.Context())
+	require.NoError(t, err)
+	target := registry + "/buildkit/testlazyimage:" + identity.NewID()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name":           target,
+					"push":           "true",
+					"compression":    "estargz",
+					"oci-mediatypes": "true",
 				},
 			},
 		},
@@ -2446,6 +2455,44 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 		sgzLayers = append(sgzLayers, layer)
 	}
 	require.NotEqual(t, 0, len(sgzLayers), "no layer can be used for checking lazypull")
+
+	// clear all local state out
+	err = imageService.Delete(ctx, img.Name, images.SynchronousDelete())
+	require.NoError(t, err)
+	checkAllReleasable(t, c, sb, true)
+
+	// Check we can perform lazy pulling again using the built image
+	target2 := registry + "/buildkit/testlazyimage:" + identity.NewID()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name":           target2,
+					"push":           "true",
+					"compression":    "estargz",
+					"oci-mediatypes": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	img, err = imageService.Get(ctx, target2)
+	require.NoError(t, err)
+
+	manifest, err = images.Manifest(ctx, contentStore, img.Target, nil)
+	require.NoError(t, err)
+
+	// Check if image layers are lazy.
+	// The topmost(last) layer created by `Run` isn't lazy so we skip the check for the layer.
+	sgzLayers = nil
+	for _, layer := range manifest.Layers[:len(manifest.Layers)-1] {
+		_, err = contentStore.Info(ctx, layer.Digest)
+		require.ErrorIs(t, err, ctderrdefs.ErrNotFound, "unexpected error %v", err)
+		sgzLayers = append(sgzLayers, layer)
+	}
+	require.NotEqual(t, 0, len(sgzLayers), "no layer can be used for checking lazypull (re-pulled)")
 
 	// The topmost(last) layer created by `Run` shouldn't be lazy
 	_, err = contentStore.Info(ctx, manifest.Layers[len(manifest.Layers)-1].Digest)

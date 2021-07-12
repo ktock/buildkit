@@ -2,7 +2,9 @@ package cache
 
 import (
 	"context"
+	"io"
 
+	ctdcompression "github.com/containerd/containerd/archive/compression"
 	"github.com/containerd/containerd/diff"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
@@ -53,7 +55,7 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 		})
 	}
 	eg.Go(func() error {
-		dp, err := g.Do(ctx, sr.ID(), func(ctx context.Context) (interface{}, error) {
+		dp, err := g.Do(ctx, sr.ID(), func(ctx context.Context) (_ interface{}, retErr error) {
 			refInfo := sr.Info()
 			if refInfo.Blob != "" {
 				if forceCompression {
@@ -70,18 +72,35 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 				return nil, errors.WithStack(ErrNoBlobs)
 			}
 
+			var descr ocispec.Descriptor
+			var err error
+
 			var mediaType string
+			var compressor func(dest io.Writer, mediaType string) (io.WriteCloser, error)
 			switch compressionType {
 			case compression.Uncompressed:
 				mediaType = ocispec.MediaTypeImageLayer
 			case compression.Gzip:
 				mediaType = ocispec.MediaTypeImageLayerGzip
+				compressor = func(dest io.Writer, requiredMediaType string) (io.WriteCloser, error) {
+					if mediaType != requiredMediaType {
+						return nil, errors.Errorf("unsupported media type for gzip compressor %q", requiredMediaType)
+					}
+					return ctdcompression.CompressStream(dest, ctdcompression.Gzip)
+				}
+			case compression.EStargz:
+				w, mt, saveLabels := writeEStargz()
+				compressor, mediaType = w, mt
+				defer func() {
+					if retErr == nil {
+						if err := saveLabels(ctx, sr.cm.ContentStore, descr.Digest); err != nil {
+							retErr = err
+						}
+					}
+				}()
 			default:
 				return nil, errors.Errorf("unknown layer compression type: %q", compressionType)
 			}
-
-			var descr ocispec.Descriptor
-			var err error
 
 			if descr.Digest == "" {
 				// reference needs to be committed
@@ -112,8 +131,9 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					defer release()
 				}
 				descr, err = sr.cm.Differ.Compare(ctx, lower, upper,
-					diff.WithMediaType(mediaType),
 					diff.WithReference(sr.ID()),
+					diff.WithMediaType(mediaType),
+					diff.WithCompressor(compressor),
 				)
 				if err != nil {
 					return nil, err
@@ -137,12 +157,6 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 				return nil, errors.Errorf("unknown layer compression type")
 			}
 
-			if forceCompression {
-				if err := ensureCompression(ctx, sr, descr, compressionType, s); err != nil {
-					return nil, err
-				}
-			}
-
 			return descr, nil
 
 		})
@@ -162,6 +176,13 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 	if currentDescr.Digest != "" {
 		if err := sr.setBlob(baseCtx, currentDescr); err != nil {
 			return err
+		}
+		if forceCompression {
+			// Ensure the layer is compresed as expected. If needed, forcefully create
+			// the compression variant here.
+			if err := ensureCompression(ctx, sr, currentDescr, compressionType, s); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
