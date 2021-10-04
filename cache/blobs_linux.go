@@ -72,7 +72,7 @@ func (sr *immutableRef) tryComputeOverlayBlob(ctx context.Context, lower, upper 
 		}
 	}()
 
-	bufW := bufio.NewWriterSize(cw, 16384)
+	bufW := bufio.NewWriterSize(cw, 8192)
 	var labels map[string]string
 	if compressorFunc != nil {
 		dgstr := digest.SHA256.Digester()
