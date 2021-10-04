@@ -1,0 +1,25 @@
+name: Test
+on: push
+
+env:
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    name: Test
+    env:
+      TEST_RESULT_DIR: ${{ github.workspace }}/result/
+      TEST_IMAGE: ghcr.io/stargz-containers/ubuntu:20.04-org
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run
+      run: |
+        mkdir -p ${{ env.TEST_RESULT_DIR }}
+        for I in $(seq 1 3) ; do
+          ./hack/overlay/test.sh ${{ env.TEST_RESULT_DIR }}/${I} ${TEST_IMAGE}
+        done
+    - uses: actions/upload-artifact@v2.2.4
+      with:
+        name: result
+        path: ${{ env.TEST_RESULT_DIR }}
