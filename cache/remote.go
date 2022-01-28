@@ -52,7 +52,7 @@ func (sr *immutableRef) GetRemotes(ctx context.Context, createIfNeeded bool, com
 	// compression with all combination of copmressions
 	res := []*solver.Remote{remote}
 	topmost, parentChain := remote.Descriptors[len(remote.Descriptors)-1], remote.Descriptors[:len(remote.Descriptors)-1]
-	vDesc, err := getCompressionVariantBlob(ctx, sr.cm.ContentStore, topmost.Digest, compressionopt.Type)
+	vDesc, err := getBlobWithCompression(ctx, sr.cm.ContentStore, topmost, compressionopt.Type)
 	if err != nil {
 		return res, nil // compression variant doesn't exist. return the main blob only.
 	}
@@ -107,16 +107,16 @@ func getAvailableBlobs(ctx context.Context, cs content.Store, chain *solver.Remo
 	if err != nil {
 		return nil, err
 	}
-	compressions, err := getCompressionVariants(ctx, cs, target.Digest)
-	if err != nil {
+	var descs []ocispecs.Descriptor
+	if err := walkBlob(ctx, cs, target, func(desc ocispecs.Descriptor) bool {
+		descs = append(descs, desc)
+		return true
+	}); err != nil {
 		return nil, err
 	}
 	var res []*solver.Remote
-	for _, c := range compressions {
-		desc, err := getCompressionVariantBlob(ctx, cs, target.Digest, c)
-		if err != nil {
-			return nil, err
-		}
+	for _, desc := range descs {
+		desc := desc
 		if len(parents) == 0 { // bottommost ref
 			res = append(res, &solver.Remote{
 				Descriptors: []ocispecs.Descriptor{desc},
@@ -216,9 +216,9 @@ func (sr *immutableRef) getRemote(ctx context.Context, createIfNeeded bool, comp
 			} else if needs {
 				// ensure the compression type.
 				// compressed blob must be created and stored in the content store.
-				blobDesc, err := ref.getCompressionBlob(ctx, comp.Type)
+				blobDesc, err := getBlobWithCompressionWithRetry(ctx, ref, comp, s)
 				if err != nil {
-					return nil, errors.Wrapf(err, "compression blob for %q not found", comp.Type)
+					return nil, errors.Wrapf(err, "failed to get compression blob %q", comp.Type)
 				}
 				newDesc := desc
 				newDesc.MediaType = blobDesc.MediaType
@@ -247,6 +247,16 @@ func (sr *immutableRef) getRemote(ctx context.Context, createIfNeeded bool, comp
 		})
 	}
 	return remote, nil
+}
+
+func getBlobWithCompressionWithRetry(ctx context.Context, ref *immutableRef, comp compression.Config, s session.Group) (ocispecs.Descriptor, error) {
+	if blobDesc, err := ref.getBlobWithCompression(ctx, comp.Type); err == nil {
+		return blobDesc, nil
+	}
+	if err := ensureCompression(ctx, ref, comp, s); err != nil {
+		return ocispecs.Descriptor{}, errors.Wrapf(err, "failed to get and ensure compression type of %q", comp.Type)
+	}
+	return ref.getBlobWithCompression(ctx, comp.Type)
 }
 
 type lazyMultiProvider struct {
@@ -293,6 +303,11 @@ func (p lazyRefProvider) ReaderAt(ctx context.Context, desc ocispecs.Descriptor)
 
 func (p lazyRefProvider) Unlazy(ctx context.Context) error {
 	_, err := p.ref.cm.unlazyG.Do(ctx, string(p.desc.Digest), func(ctx context.Context) (_ interface{}, rerr error) {
+		defer func() {
+			if rerr == nil {
+				rerr = p.ref.addBlob(ctx, p.desc)
+			}
+		}()
 		if isLazy, err := p.ref.isLazy(ctx); err != nil {
 			return nil, err
 		} else if !isLazy {
@@ -332,14 +347,6 @@ func (p lazyRefProvider) Unlazy(ctx context.Context) error {
 			}
 		}
 
-		compressionType := compression.FromMediaType(p.desc.MediaType)
-		if compressionType == compression.UnknownCompression {
-			return nil, errors.Errorf("unhandled layer media type: %q", p.desc.MediaType)
-		}
-
-		if err := p.ref.addCompressionBlob(ctx, p.desc, compressionType); err != nil {
-			return nil, err
-		}
 		return nil, nil
 	})
 	return err

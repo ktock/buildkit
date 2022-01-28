@@ -16,6 +16,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // needsConversion indicates whether a conversion is needed for the specified descriptor to
@@ -121,6 +122,7 @@ type conversion struct {
 }
 
 func (c *conversion) convert(ctx context.Context, cs content.Store, desc ocispecs.Descriptor) (*ocispecs.Descriptor, error) {
+	logrus.WithField("blob", desc).WithField("target", c.target).Debugf("converting blob to the target compression")
 	// prepare the source and destination
 	labelz := make(map[string]string)
 	ref := fmt.Sprintf("convert-from-%s-to-%s-%s", desc.Digest, c.target.Type.String(), identity.NewID())
