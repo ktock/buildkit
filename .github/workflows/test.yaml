@@ -1,0 +1,29 @@
+name: Benchmark
+on: push
+
+env:
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    name: Test
+    env:
+      TEST_RESULT_DIR: ${{ github.workspace }}/result/
+      TEST_IMAGES_REGISTRY: ghcr.io/stargz-containers
+      TEST_IMAGES: ubuntu:20.04-org tomcat:10.0.0-jdk15-openjdk-buster-org
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run
+      run: |
+        mkdir -p ${{ env.TEST_RESULT_DIR }}
+        for IMAGE in ${TEST_IMAGES}; do
+          for I in $(seq 1 3) ; do
+            NAME=$(echo ${IMAGE} | sed -E 's/^([^:]*).*/\1/g' | tr -d '\n')
+            ./hack/blob/test.sh ${{ env.TEST_RESULT_DIR }}/${NAME}-${I} ${TEST_IMAGES_REGISTRY} ${IMAGE}
+          done
+        done
+    - uses: actions/upload-artifact@v2.2.4
+      with:
+        name: result
+        path: ${{ env.TEST_RESULT_DIR }}
