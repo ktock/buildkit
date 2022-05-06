@@ -1118,19 +1118,40 @@ func (lbf *llbBridgeForwarder) NewContainer(ctx context.Context, in *pb.NewConta
 			var ok bool
 			workerRef, ok = lbf.workerRefByID[m.ResultID]
 			if !ok {
-				refProxy, err := lbf.convertRef(m.ResultID)
-				if err != nil {
-					return nil, errors.Wrapf(err, "failed to find ref %s for %q mount", m.ResultID, m.Dest)
-				}
+				var refErr error
+				workerRef, refErr = func() (*worker.WorkerRef, error) {
+					refProxy, err := lbf.convertRef(m.ResultID)
+					if err != nil {
+						return nil, errors.Wrapf(err, "failed to find ref %s for %q mount", m.ResultID, m.Dest)
+					}
 
-				res, err := refProxy.Result(ctx)
-				if err != nil {
-					return nil, stack.Enable(err)
-				}
+					res, err := refProxy.Result(ctx)
+					if err != nil {
+						return nil, stack.Enable(err)
+					}
 
-				workerRef, ok = res.Sys().(*worker.WorkerRef)
-				if !ok {
-					return nil, errors.Errorf("invalid reference %T", res.Sys())
+					workerRef, ok = res.Sys().(*worker.WorkerRef)
+					if !ok {
+						return nil, errors.Errorf("invalid reference %T", res.Sys())
+					}
+
+					return workerRef, nil
+				}()
+				if refErr != nil {
+					w, err := lbf.workers.GetDefault()
+					if err != nil {
+						return nil, refErr
+					}
+					refGetter, getterOk := w.(interface{
+						WorkerRefByID(id string) (*worker.WorkerRef, bool)
+					})
+					if !getterOk {
+						return nil, refErr
+					}
+					workerRef, ok = refGetter.WorkerRefByID(m.ResultID)
+					if !ok {
+						return nil, errors.Errorf("failed to find ref %s for %q mount", m.ResultID, m.Dest)
+					}
 				}
 			}
 		}
