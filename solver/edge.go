@@ -2,6 +2,7 @@ package solver
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 )
+
+const debuggable = true // TODO: make configurable
 
 type edgeStatusType int
 
@@ -145,11 +148,15 @@ func (e *edge) releaseResult() {
 
 // commitOptions returns parameters for the op execution
 func (e *edge) commitOptions() ([]*CacheKey, []CachedResult) {
-	k := NewCacheKey(e.cacheMap.Digest, e.edge.Vertex.Digest(), e.edge.Index)
+	return e.commitOptionsIndex(e.edge.Index)
+}
+
+func (e *edge) commitOptionsIndex(index Index) ([]*CacheKey, []CachedResult) {
+	k := NewCacheKey(e.cacheMap.Digest, e.edge.Vertex.Digest(), index)
 	if len(e.deps) == 0 {
 		keys := make([]*CacheKey, 0, len(e.cacheMapDigests))
 		for _, dgst := range e.cacheMapDigests {
-			keys = append(keys, NewCacheKey(dgst, e.edge.Vertex.Digest(), e.edge.Index))
+			keys = append(keys, NewCacheKey(dgst, e.edge.Vertex.Digest(), index))
 		}
 		return keys, nil
 	}
@@ -955,23 +962,125 @@ func (e *edge) loadCache(ctx context.Context) (any, error) {
 	return NewCachedResult(res, []ExportableCacheKey{{CacheKey: rec.key, Exporter: &exporter{k: rec.key, record: rec, edge: e}}}), nil
 }
 
+// loadResults returns cached results of this edge.
+func (e *edge) loadResultsAtLeast(ctx context.Context, index Index) ([]Result, []ExportableCacheKey, error) {
+	var results []Result
+	var subExporters []ExportableCacheKey
+	for i := 0; i <= int(index); i++ {
+		var records []*CacheRecord
+		cacheKeys, _ := e.commitOptionsIndex(Index(i))
+		for _, cacheKey := range cacheKeys {
+			records = append(records, e.queryRecords(ctx, cacheKey)...)
+		}
+		if len(records) == 0 {
+			return nil, nil, fmt.Errorf("no record for output %d", i)
+		}
+		rec := getBestResult(records)
+		res, err := e.op.Cache().Load(ctx, rec)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error get cache ref: %v", err)
+		}
+		results = append(results, res)
+		if i == int(e.edge.Index) {
+			subExporters = []ExportableCacheKey{{CacheKey: rec.key, Exporter: &exporter{k: rec.key, record: rec, edge: e}}}
+		}
+	}
+	return results, subExporters, nil
+}
+
+// queryRecords queries cache records by the specified cache key and returns all matched cache records
+func (e *edge) queryRecords(ctx context.Context, cacheKey *CacheKey) (records []*CacheRecord) {
+	keys := make(map[string]*CacheKey)
+	if len(cacheKey.Deps()) == 0 {
+		var err error
+		gotKeys, err := e.op.Cache().Query(nil, 0, cacheKey.Digest(), cacheKey.Output())
+		if err != nil {
+			bklog.G(ctx).WithError(err).Warnf("failed to query")
+		} else {
+			for _, got := range gotKeys {
+				keys[got.ID] = got
+			}
+		}
+	} else {
+		for i, deps := range cacheKey.Deps() {
+			depKeys, err := e.op.Cache().Query(deps, Index(i), cacheKey.Digest(), cacheKey.Output())
+			if err != nil {
+				bklog.G(ctx).WithError(err).Warnf("failed to query")
+				continue
+			}
+			depKeyMap := make(map[string]*CacheKey)
+			for _, got := range depKeys {
+				depKeyMap[got.ID] = got
+			}
+			if i == 0 {
+				keys = depKeyMap
+				continue
+			}
+			for id := range keys {
+				if _, ok := depKeyMap[id]; !ok {
+					delete(keys, id)
+				}
+			}
+		}
+	}
+	for _, k := range keys {
+		mergedKey := k.clone()
+		mergedKey.deps = cacheKey.Deps()
+		recs, err := e.op.Cache().Records(mergedKey)
+		if err != nil {
+			bklog.G(context.TODO()).Errorf("error receiving cache records: %v %+v", err, cacheKey)
+			continue
+		}
+		records = append(records, recs...)
+	}
+	return records
+}
+
 // execOp creates a request to execute the vertex operation
 func (e *edge) execOp(ctx context.Context) (any, error) {
 	cacheKeys, inputs := e.commitOptions()
-	results, subExporters, err := e.op.Exec(ctx, toResultSlice(inputs))
-	if err != nil {
-		return nil, errors.WithStack(err)
+
+	var results []Result
+	var subExporters []ExportableCacheKey
+	if debuggable {
+		op, err := e.op.(*sharedOp).getOp()
+		if err != nil {
+			return nil, fmt.Errorf("cannot get op")
+		}
+		results, subExporters, err = e.loadResultsAtLeast(ctx, e.edge.Index) // TODO: load results of all outputs
+		if err != nil {
+			bklog.G(context.TODO()).WithError(err).Debugf("no results loaded")
+		} else {
+			op.(interface {
+				LoadCacheHook(context.Context, []Result, []Result)
+			}).LoadCacheHook(ctx, toResultSlice(inputs), results)
+		}
 	}
 
 	index := e.edge.Index
 	if len(results) <= int(index) {
-		return nil, errors.Errorf("invalid response from exec need %d index but %d results received", index, len(results))
+		var err error
+		results, subExporters, err = e.op.Exec(ctx, toResultSlice(inputs))
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
 	}
 
+	if len(results) <= int(index) {
+		return nil, errors.Errorf("invalid response from exec need %d index but %d results received", index, len(results))
+	}
 	res := results[int(index)]
 
 	for i := range results {
 		if i != int(index) {
+			if debuggable {
+				cacheKeys, _ := e.commitOptionsIndex(Index(i))
+				for _, cacheKey := range cacheKeys {
+					if _, err := e.op.Cache().Save(cacheKey, results[i], time.Now()); err != nil {
+						return nil, err
+					}
+				}
+			}
 			go results[i].Release(context.TODO())
 		}
 	}
