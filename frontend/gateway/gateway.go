@@ -1142,7 +1142,7 @@ func (lbf *llbBridgeForwarder) NewContainer(ctx context.Context, in *pb.NewConta
 					if err != nil {
 						return nil, refErr
 					}
-					refGetter, getterOk := w.(interface{
+					refGetter, getterOk := w.(interface {
 						WorkerRefByID(id string) (*worker.WorkerRef, bool)
 					})
 					if !getterOk {

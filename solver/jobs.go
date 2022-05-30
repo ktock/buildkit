@@ -877,7 +877,7 @@ type sharedOp struct {
 }
 
 func (s *sharedOp) IgnoreCache() bool {
-	return s.st.vtx.Options().IgnoreCache
+	return s.st.vtx.Options().IgnoreCache || debuggable
 }
 
 func (s *sharedOp) Cache() CacheManager {
