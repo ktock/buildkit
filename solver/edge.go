@@ -1051,9 +1051,13 @@ func (e *edge) execOp(ctx context.Context) (any, error) {
 		if err != nil {
 			bklog.G(context.TODO()).WithError(err).Debugf("no results loaded")
 		} else {
-			op.(interface {
+			if hook, ok := op.(interface {
 				LoadCacheHook(context.Context, []Result, []Result)
-			}).LoadCacheHook(ctx, toResultSlice(inputs), results)
+			}); ok {
+				hook.LoadCacheHook(ctx, toResultSlice(inputs), results)
+			} else {
+				bklog.G(context.TODO()).Debugf("op is not hookable")
+			}
 		}
 	}
 
