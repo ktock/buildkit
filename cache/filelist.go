@@ -35,7 +35,12 @@ func (sr *immutableRef) FileList(ctx context.Context, s session.Group) ([]string
 		}
 
 		// lazy blobs need to be pulled first
-		if err := sr.Extract(ctx, s); err != nil {
+		// if err := sr.Extract(ctx, s); err != nil {
+		// 	return nil, err
+		// }
+
+		// unpack the layer contents and ensure the blob exists in the content store.
+		if err := sr.unlazy(ctx, sr.descHandlers, sr.progress, s, true, true); err != nil {
 			return nil, err
 		}
 
