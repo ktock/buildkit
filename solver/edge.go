@@ -1026,7 +1026,7 @@ func (e *edge) queryRecords(ctx context.Context, cacheKey *CacheKey) (records []
 	for _, k := range keys {
 		mergedKey := k.clone()
 		mergedKey.deps = cacheKey.Deps()
-		recs, err := e.op.Cache().Records(mergedKey)
+		recs, err := e.op.Cache().Records(context.Background(), mergedKey)
 		if err != nil {
 			bklog.G(context.TODO()).Errorf("error receiving cache records: %v %+v", err, cacheKey)
 			continue

@@ -140,6 +140,8 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 		return nil, err
 	}
 
+	var defaultWorker worker.Worker
+	
 	if isDevel {
 		devRes, err := llbBridge.Solve(ctx,
 			frontend.SolveRequest{
@@ -169,6 +171,7 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 		if !ok {
 			return nil, errors.Errorf("invalid ref: %T", res.Sys())
 		}
+		defaultWorker = workerRef.Worker
 
 		rootFS, err = workerRef.Worker.CacheManager().New(ctx, workerRef.ImmutableRef, session.NewGroup(sid))
 		if err != nil {
@@ -270,6 +273,7 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 		if !ok {
 			return nil, errors.Errorf("invalid ref: %T", r.Sys())
 		}
+		defaultWorker = workerRef.Worker
 		rootFS, err = workerRef.Worker.CacheManager().New(ctx, workerRef.ImmutableRef, session.NewGroup(sid))
 		if err != nil {
 			return nil, err
@@ -332,7 +336,7 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 		}
 	}
 
-	lbf, ctx := serveLLBBridgeForwarder(ctx, llbBridge, exec, gf.workers, inputs, sid, sm)
+	lbf, ctx := serveLLBBridgeForwarder(ctx, llbBridge, exec, gf.workers, inputs, sid, sm, defaultWorker)
 	defer lbf.conn.Close()
 	defer lbf.Discard()
 
@@ -478,11 +482,11 @@ func (lbf *llbBridgeForwarder) Result() (*frontend.Result, error) {
 	return lbf.result, nil
 }
 
-func NewBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridge, exec executor.Executor, workers worker.Infos, inputs map[string]*opspb.Definition, sid string, sm *session.Manager) LLBBridgeForwarder {
-	return newBridgeForwarder(ctx, llbBridge, exec, workers, inputs, sid, sm)
+func NewBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridge, exec executor.Executor, workers worker.Infos, inputs map[string]*opspb.Definition, sid string, sm *session.Manager, defaultWorker worker.Worker) LLBBridgeForwarder {
+	return newBridgeForwarder(ctx, llbBridge, exec, workers, inputs, sid, sm, defaultWorker)
 }
 
-func newBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridge, exec executor.Executor, workers worker.Infos, inputs map[string]*opspb.Definition, sid string, sm *session.Manager) *llbBridgeForwarder {
+func newBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridge, exec executor.Executor, workers worker.Infos, inputs map[string]*opspb.Definition, sid string, sm *session.Manager, defaultWorker worker.Worker) *llbBridgeForwarder {
 	lbf := &llbBridgeForwarder{
 		callCtx:       ctx,
 		llbBridge:     llbBridge,
@@ -496,13 +500,14 @@ func newBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridg
 		sm:            sm,
 		ctrs:          map[string]gwclient.Container{},
 		executor:      exec,
+		defaultWorker: defaultWorker,
 	}
 	return lbf
 }
 
-func serveLLBBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridge, exec executor.Executor, workers worker.Infos, inputs map[string]*opspb.Definition, sid string, sm *session.Manager) (*llbBridgeForwarder, context.Context) {
+func serveLLBBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridge, exec executor.Executor, workers worker.Infos, inputs map[string]*opspb.Definition, sid string, sm *session.Manager, defaultWorker worker.Worker) (*llbBridgeForwarder, context.Context) {
 	ctx, cancel := context.WithCancelCause(ctx)
-	lbf := newBridgeForwarder(ctx, llbBridge, exec, workers, inputs, sid, sm)
+	lbf := newBridgeForwarder(ctx, llbBridge, exec, workers, inputs, sid, sm, defaultWorker)
 	serverOpt := []grpc.ServerOption{
 		grpc.UnaryInterceptor(grpcerrors.UnaryServerInterceptor),
 		grpc.StreamInterceptor(grpcerrors.StreamServerInterceptor),
@@ -610,6 +615,8 @@ type llbBridgeForwarder struct {
 	*pipe
 	ctrs   map[string]gwclient.Container
 	ctrsMu sync.Mutex
+
+	defaultWorker worker.Worker
 }
 
 func (lbf *llbBridgeForwarder) ResolveSourceMeta(ctx context.Context, req *pb.ResolveSourceMetaRequest) (*pb.ResolveSourceMetaResponse, error) {
@@ -1138,11 +1145,7 @@ func (lbf *llbBridgeForwarder) NewContainer(ctx context.Context, in *pb.NewConta
 					return workerRef, nil
 				}()
 				if refErr != nil {
-					w, err := lbf.workers.GetDefault()
-					if err != nil {
-						return nil, refErr
-					}
-					refGetter, getterOk := w.(interface {
+					refGetter, getterOk := lbf.defaultWorker.(interface {
 						WorkerRefByID(id string) (*worker.WorkerRef, bool)
 					})
 					if !getterOk {
