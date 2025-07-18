@@ -1732,6 +1732,7 @@ func TestGetRemotes(t *testing.T) {
 
 	// Call GetRemotes on all the refs
 	eg, egctx := errgroup.WithContext(ctx)
+	var testMu sync.RWMutex
 	for _, ir := range refs {
 		ir := ir.(*immutableRef)
 		for _, compressionType := range []compression.Type{compression.Uncompressed, compression.Gzip, compression.EStargz, compression.Zstd} {
@@ -1740,7 +1741,9 @@ func TestGetRemotes(t *testing.T) {
 				if compressionType != compression.Gzip {
 					<-waitForGzipCh
 				}
+				testMu.RLock()
 				remotes, err := ir.GetRemotes(egctx, true, refCfg, false, nil)
+				testMu.RUnlock()
 				require.NoError(t, err)
 				require.Equal(t, 1, len(remotes))
 				remote := remotes[0]
@@ -1778,30 +1781,34 @@ func TestGetRemotes(t *testing.T) {
 					variantsMapMu.Unlock()
 
 					r := refChain[i]
-					isLazy, err := r.isLazy(egctx)
-					require.NoError(t, err)
-					if (compressionType == compression.Gzip) && (i == 0) {
-						closedMu.Lock()
-						if !closed {
-							closed = true
-							close(waitForGzipCh)
-							time.Sleep(time.Second)
-						}
-						closedMu.Unlock()
-					}
-					needs, err := compressionType.NeedsConversion(ctx, co.cs, desc)
-					require.NoError(t, err)
-					if needs {
-						require.False(t, isLazy, "layer %q requires conversion so it must be unlazied", desc.Digest)
-					}
-					bDesc, err := r.getBlobWithCompression(egctx, compressionType)
-					if isLazy {
-						require.Error(t, err)
-					} else {
+					func() {
+						testMu.Lock()
+						defer testMu.Unlock()
+						isLazy, err := r.isLazy(egctx)
 						require.NoError(t, err)
-						checkDescriptor(ctx, t, co.cs, bDesc, compressionType)
-						require.Equal(t, desc.Digest, bDesc.Digest)
-					}
+						if (compressionType == compression.Gzip) && (i == 0) {
+							closedMu.Lock()
+							if !closed {
+								closed = true
+								close(waitForGzipCh)
+								time.Sleep(time.Second)
+							}
+							closedMu.Unlock()
+						}
+						needs, err := compressionType.NeedsConversion(ctx, co.cs, desc)
+						require.NoError(t, err)
+						if needs {
+							require.False(t, isLazy, "layer %q requires conversion so it must be unlazied", desc.Digest)
+						}
+						bDesc, err := r.getBlobWithCompression(egctx, compressionType)
+						if isLazy {
+							require.Error(t, err)
+						} else {
+							require.NoError(t, err)
+							checkDescriptor(ctx, t, co.cs, bDesc, compressionType)
+							require.Equal(t, desc.Digest, bDesc.Digest)
+						}
+					}()
 				}
 				return nil
 			})
