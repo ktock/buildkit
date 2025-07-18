@@ -1726,6 +1726,10 @@ func TestGetRemotes(t *testing.T) {
 	variantsMap := make(map[string]idxToVariants)
 	var variantsMapMu sync.Mutex
 
+	waitForGzipCh := make(chan struct{})
+	closed := false
+	var closedMu sync.Mutex
+
 	// Call GetRemotes on all the refs
 	eg, egctx := errgroup.WithContext(ctx)
 	for _, ir := range refs {
@@ -1733,6 +1737,9 @@ func TestGetRemotes(t *testing.T) {
 		for _, compressionType := range []compression.Type{compression.Uncompressed, compression.Gzip, compression.EStargz, compression.Zstd} {
 			refCfg := config.RefConfig{Compression: compression.New(compressionType).SetForce(true)}
 			eg.Go(func() error {
+				if compressionType != compression.Gzip {
+					<-waitForGzipCh
+				}
 				remotes, err := ir.GetRemotes(egctx, true, refCfg, false, nil)
 				require.NoError(t, err)
 				require.Equal(t, 1, len(remotes))
@@ -1773,6 +1780,15 @@ func TestGetRemotes(t *testing.T) {
 					r := refChain[i]
 					isLazy, err := r.isLazy(egctx)
 					require.NoError(t, err)
+					if (compressionType == compression.Gzip) && (i == 0) {
+						closedMu.Lock()
+						if !closed {
+							closed = true
+							close(waitForGzipCh)
+							time.Sleep(time.Second)
+						}
+						closedMu.Unlock()
+					}
 					needs, err := compressionType.NeedsConversion(ctx, co.cs, desc)
 					require.NoError(t, err)
 					if needs {
